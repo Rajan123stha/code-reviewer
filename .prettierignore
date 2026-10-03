@@ -1,0 +1,6 @@
+dist/
+coverage/
+pnpm-lock.yaml
+packages/review-core/prompts/
+packages/db/src/generated/
+apps/cli/examples/

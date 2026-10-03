@@ -1,0 +1,78 @@
+# Local stack. From the repo root:
+#   docker compose -f infra/docker-compose.yml up -d                     # Postgres + Redis only
+#   docker compose -f infra/docker-compose.yml --profile app up -d       # + api and worker containers
+#   docker compose -f infra/docker-compose.yml --profile tracing up -d   # + Jaeger (UI on :16686)
+name: reviewlens
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: reviewlens
+      POSTGRES_PASSWORD: reviewlens
+      POSTGRES_DB: reviewlens
+    ports: ['5432:5432']
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U reviewlens -d reviewlens']
+      interval: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    # BullMQ requires noeviction: evicted keys would silently lose jobs.
+    command: ['redis-server', '--appendonly', 'yes', '--maxmemory-policy', 'noeviction']
+    ports: ['6379:6379']
+    volumes: [redisdata:/data]
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      retries: 10
+
+  api:
+    profiles: [app]
+    build:
+      context: ..
+      dockerfile: infra/docker/node.Dockerfile
+      args: { APP: api }
+    env_file: ../.env
+    environment:
+      REDIS_URL: redis://redis:6379
+      DATABASE_URL: postgresql://reviewlens:reviewlens@postgres:5432/reviewlens
+    ports: ['3000:3000']
+    depends_on:
+      redis: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+
+  worker:
+    profiles: [app]
+    build:
+      context: ..
+      dockerfile: infra/docker/node.Dockerfile
+      args: { APP: worker }
+    env_file: ../.env
+    environment:
+      REDIS_URL: redis://redis:6379
+      DATABASE_URL: postgresql://reviewlens:reviewlens@postgres:5432/reviewlens
+      GITHUB_APP_PRIVATE_KEY_PATH: /run/secrets/github_app_key
+    secrets: [github_app_key]
+    depends_on:
+      redis: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+
+  jaeger:
+    profiles: [tracing]
+    image: jaegertracing/jaeger:latest
+    ports:
+      - '16686:16686' # UI
+      - '4318:4318' # OTLP over HTTP
+
+secrets:
+  github_app_key:
+    file: ../reviewlens.private-key.pem
+
+volumes:
+  pgdata:
+  redisdata:

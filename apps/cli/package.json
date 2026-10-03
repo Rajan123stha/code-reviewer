@@ -1,0 +1,22 @@
+{
+  "name": "@reviewlens/cli",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "reviewlens": "./dist/main.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json",
+    "dev": "tsx --conditions=source src/main.ts"
+  },
+  "dependencies": {
+    "@reviewlens/context-engine": "workspace:*",
+    "@reviewlens/github": "workspace:*",
+    "@reviewlens/llm": "workspace:*",
+    "@reviewlens/review-core": "workspace:*",
+    "@reviewlens/shared": "workspace:*",
+    "zod": "^4.6.5"
+  }
+}

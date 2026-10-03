@@ -1,0 +1,173 @@
+import type { ParseCache } from '@reviewlens/context-engine';
+import type { ReviewStore } from '@reviewlens/db';
+import {
+  createReview,
+  fetchCompareDiff,
+  fetchPullRequest,
+  githubSnapshot,
+  type GitHubClient,
+} from '@reviewlens/github';
+import { LLMError, type LLMClient } from '@reviewlens/llm';
+import {
+  configHash,
+  formatReviewBody,
+  runReview,
+  type StrategyConfig,
+} from '@reviewlens/review-core';
+import { withSpan, type Logger, type ReviewJobData } from '@reviewlens/shared';
+import { UnrecoverableError } from 'bullmq';
+
+/** GitHub statuses that will not succeed on retry (bad auth, missing PR, stale/invalid review). */
+const NON_RETRYABLE_STATUSES = new Set([401, 404, 422]);
+
+export interface ReviewDeps {
+  getClient(installationId: number): Promise<GitHubClient>;
+  llm: LLMClient;
+  store: ReviewStore;
+  /** Parse cache for graph strategies (S3, S4). */
+  parseCache?: ParseCache | undefined;
+  config: StrategyConfig;
+  logger: Logger;
+}
+
+export type ReviewJobResult =
+  | {
+      status: 'posted';
+      reviewId: number;
+      githubReviewId: number | null;
+      comments: number;
+      costUsd: number | null;
+    }
+  | { status: 'already_posted'; reviewId: number }
+  | { status: 'skipped'; reason: 'superseded' | 'closed' };
+
+export async function processReviewJob(
+  job: ReviewJobData,
+  deps: ReviewDeps,
+): Promise<ReviewJobResult> {
+  const ref = { owner: job.owner, repo: job.repo, pullNumber: job.pullNumber };
+  const repo = { owner: job.owner, repo: job.repo };
+  const log = deps.logger.child({ ...ref, headSha: job.headSha, deliveryId: job.deliveryId });
+
+  return withSpan(
+    'review.process',
+    {
+      'github.repository': `${job.owner}/${job.repo}`,
+      'github.pr': job.pullNumber,
+      'review.strategy': deps.config.strategy,
+    },
+    async () => {
+      let reviewId: number | undefined;
+      try {
+        const client = await deps.getClient(job.installationId);
+        const pr = await fetchPullRequest(client, ref);
+        // A newer push queued its own job; reviewing this commit would be wasted work.
+        if (pr.headSha !== job.headSha) {
+          log.info({ currentHead: pr.headSha }, 'skipping superseded commit');
+          return { status: 'skipped', reason: 'superseded' };
+        }
+        if (pr.state !== 'open') {
+          log.info({ state: pr.state }, 'skipping closed pull request');
+          return { status: 'skipped', reason: 'closed' };
+        }
+
+        const pullRequestId = await deps.store.upsertPullRequest({
+          installation: { githubId: job.installationId, account: job.owner },
+          repository: { githubId: job.repositoryId, fullName: `${job.owner}/${job.repo}` },
+          pullRequest: {
+            number: job.pullNumber,
+            title: pr.title,
+            headSha: job.headSha,
+            baseSha: job.baseSha,
+          },
+        });
+        const start = await deps.store.startReview({
+          pullRequestId,
+          headSha: job.headSha,
+          config: deps.config,
+          configHash: configHash(deps.config),
+        });
+        reviewId = start.reviewId;
+        if (start.alreadyPosted) {
+          log.info({ reviewId }, 'review already posted for this commit and config');
+          return { status: 'already_posted', reviewId };
+        }
+
+        const diff = await fetchCompareDiff(client, repo, job.baseSha, job.headSha);
+        const run = await runReview(
+          {
+            pr: {
+              ...ref,
+              number: job.pullNumber,
+              title: pr.title,
+              body: pr.body,
+              baseSha: job.baseSha,
+              headSha: job.headSha,
+            },
+            diff,
+            head: githubSnapshot(client, repo, job.headSha),
+          },
+          deps.config,
+          { llm: deps.llm, parseCache: deps.parseCache },
+        );
+        await deps.store.completeReview(reviewId, run);
+
+        // Nothing to say: stay quiet rather than posting an empty review on every push.
+        let githubReviewId: number | null = null;
+        if (run.selected.length > 0) {
+          const posted = await createReview(client, ref, {
+            commitId: job.headSha,
+            body: formatReviewBody(run.selected.length, {
+              strategy: deps.config.strategy,
+              model: run.llm?.servedModel ?? deps.config.model,
+            }),
+            comments: run.selected.map((c) => ({ path: c.file, line: c.line, body: c.body })),
+          });
+          githubReviewId = posted.reviewId;
+        }
+        await deps.store.markPosted(reviewId, githubReviewId);
+
+        log.info(
+          {
+            reviewId,
+            githubReviewId,
+            candidates: run.candidates.length,
+            posted: run.selected.length,
+            costUsd: run.llm?.costUsd,
+            context: run.context,
+          },
+          'review complete',
+        );
+        return {
+          status: 'posted',
+          reviewId,
+          githubReviewId,
+          comments: run.selected.length,
+          costUsd: run.llm?.costUsd ?? null,
+        };
+      } catch (error) {
+        if (reviewId !== undefined) {
+          await deps.store
+            .markFailed(reviewId, error)
+            .catch((err: unknown) => log.error({ err }, 'could not record failure'));
+        }
+        throw classify(error, log);
+      }
+    },
+  );
+}
+
+/** Errors that a retry cannot fix become UnrecoverableError, so BullMQ stops retrying. */
+function classify(error: unknown, log: Logger): unknown {
+  if (error instanceof LLMError) {
+    if (error.retryable) return error;
+    log.error({ err: error, kind: error.kind }, 'non-retryable LLM error');
+    return new UnrecoverableError(`LLM ${error.kind}: ${error.message}`);
+  }
+  const status = (error as { status?: unknown }).status;
+  if (typeof status === 'number' && NON_RETRYABLE_STATUSES.has(status)) {
+    log.error({ err: error, status }, 'non-retryable GitHub error');
+    return new UnrecoverableError(`GitHub returned ${status}: ${(error as Error).message}`);
+  }
+  return error;
+}

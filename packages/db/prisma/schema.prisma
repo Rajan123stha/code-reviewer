@@ -1,0 +1,193 @@
+// App tables (spec §1.6). Graph and embedding tables arrive with the context engine
+// and are queried with raw SQL; they are not modeled here.
+
+generator client {
+  provider            = "prisma-client"
+  output              = "../src/generated/prisma"
+  moduleFormat        = "esm"
+  importFileExtension = "js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model Installation {
+  id                   Int          @id @default(autoincrement())
+  githubInstallationId BigInt       @unique @map("github_installation_id")
+  account              String
+  createdAt            DateTime     @default(now()) @map("created_at")
+  repositories         Repository[]
+
+  @@map("installations")
+}
+
+model Repository {
+  id             Int           @id @default(autoincrement())
+  installationId Int           @map("installation_id")
+  githubRepoId   BigInt        @unique @map("github_repo_id")
+  fullName       String        @map("full_name")
+  defaultBranch  String?       @map("default_branch")
+  lastIndexedSha String?       @map("last_indexed_sha")
+  config         Json?         @map("config_json")
+  createdAt      DateTime      @default(now()) @map("created_at")
+  installation   Installation  @relation(fields: [installationId], references: [id])
+  pullRequests   PullRequest[]
+  files          RepoFile[]
+  edges          SymbolEdge[]
+
+  @@index([installationId])
+  @@map("repositories")
+}
+
+model PullRequest {
+  id           Int        @id @default(autoincrement())
+  repositoryId Int        @map("repo_id")
+  number       Int
+  title        String
+  headSha      String     @map("head_sha")
+  baseSha      String     @map("base_sha")
+  status       String     @default("open")
+  updatedAt    DateTime   @updatedAt @map("updated_at")
+  repository   Repository @relation(fields: [repositoryId], references: [id])
+  reviews      Review[]
+
+  @@unique([repositoryId, number])
+  @@map("pull_requests")
+}
+
+enum ReviewStatus {
+  running
+  completed
+  posted
+  failed
+
+  @@map("review_status")
+}
+
+/// One pipeline run: a (PR head commit, strategy config) pair. Retries reuse the row.
+model Review {
+  id               Int                @id @default(autoincrement())
+  pullRequestId    Int                @map("pr_id")
+  headSha          String             @map("head_sha")
+  strategy         String
+  configHash       String             @map("config_hash")
+  strategyConfig   Json               @map("strategy_config_json")
+  model            String
+  servedModel      String?            @map("served_model")
+  fallbackUsed     Boolean            @default(false) @map("fallback_used")
+  promptVersion    String             @map("prompt_version")
+  promptHash       String?            @map("prompt_hash")
+  schemaName       String?            @map("schema_name")
+  status           ReviewStatus       @default(running)
+  error            String?
+  contextStats     Json?              @map("context_stats_json")
+  redactions       Json?              @map("redactions_json")
+  tokensIn         Int?               @map("tokens_in")
+  tokensOut        Int?               @map("tokens_out")
+  cacheReadTokens  Int?               @map("cache_read_tokens")
+  cacheWriteTokens Int?               @map("cache_write_tokens")
+  costUsd          Decimal?           @map("cost_usd") @db.Decimal(12, 6)
+  latencyMs        Int?               @map("latency_ms")
+  llmAttempts      Int?               @map("llm_attempts")
+  llmRequestId     String?            @map("llm_request_id")
+  githubReviewId   BigInt?            @map("github_review_id")
+  startedAt        DateTime           @default(now()) @map("started_at")
+  finishedAt       DateTime?          @map("finished_at")
+  pullRequest      PullRequest        @relation(fields: [pullRequestId], references: [id])
+  candidates       CandidateComment[]
+
+  @@unique([pullRequestId, headSha, configHash])
+  @@map("reviews")
+}
+
+/// Every comment the model proposed, including rejected ones: the filter's training data.
+model CandidateComment {
+  id               Int     @id @default(autoincrement())
+  reviewId         Int     @map("review_id")
+  index            Int
+  filePath         String  @map("file_path")
+  line             Int
+  category         String
+  severity         String
+  claim            String
+  evidence         String
+  suggestedFix     String? @map("suggested_fix")
+  body             String
+  llmConfidence    Float   @map("llm_confidence")
+  filterScore      Float?  @map("filter_score")
+  /// selected | over_cap | duplicate | invalid
+  status           String
+  rejectReason     String? @map("reject_reason")
+  duplicateOfIndex Int?    @map("duplicate_of_index")
+  rank             Int?
+  posted           Boolean @default(false)
+  review           Review  @relation(fields: [reviewId], references: [id], onDelete: Cascade)
+
+  @@unique([reviewId, index])
+  @@map("candidate_comments")
+}
+
+/// Content-addressed cache of per-file parses: key = parser version + language + git blob id.
+/// Shared across repositories; identical file contents are parsed once.
+model ParsedBlob {
+  key       String   @id
+  parse     Json
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@map("parsed_blobs")
+}
+
+/// Files of a repository's index at repositories.last_indexed_sha (default branch).
+model RepoFile {
+  id            Int          @id @default(autoincrement())
+  repositoryId  Int          @map("repo_id")
+  path          String
+  language      String
+  blobHash      String       @map("blob_hash")
+  parserVersion Int          @map("parser_version")
+  repository    Repository   @relation(fields: [repositoryId], references: [id], onDelete: Cascade)
+  symbols       CodeSymbol[]
+
+  @@unique([repositoryId, path])
+  @@map("files")
+}
+
+model CodeSymbol {
+  id             Int          @id @default(autoincrement())
+  fileId         Int          @map("file_id")
+  /// Symbol id within its file's parse (0 = module).
+  localIndex     Int          @map("local_index")
+  name           String
+  qualifiedName  String       @map("qualified_name")
+  kind           String
+  startLine      Int          @map("start_line")
+  endLine        Int          @map("end_line")
+  signature      String
+  exported       Boolean
+  parentSymbolId Int?         @map("parent_symbol_id")
+  file           RepoFile     @relation(fields: [fileId], references: [id], onDelete: Cascade)
+  outgoing       SymbolEdge[] @relation("edge_src")
+  incoming       SymbolEdge[] @relation("edge_dst")
+
+  @@unique([fileId, localIndex])
+  @@index([name])
+  @@map("symbols")
+}
+
+/// calls | imports | extends | implements
+model SymbolEdge {
+  id           Int        @id @default(autoincrement())
+  repositoryId Int        @map("repo_id")
+  srcSymbolId  Int        @map("src_symbol_id")
+  dstSymbolId  Int        @map("dst_symbol_id")
+  kind         String
+  repository   Repository @relation(fields: [repositoryId], references: [id], onDelete: Cascade)
+  src          CodeSymbol @relation("edge_src", fields: [srcSymbolId], references: [id], onDelete: Cascade)
+  dst          CodeSymbol @relation("edge_dst", fields: [dstSymbolId], references: [id], onDelete: Cascade)
+
+  @@index([repositoryId])
+  @@index([srcSymbolId])
+  @@index([dstSymbolId])
+  @@map("edges")
+}

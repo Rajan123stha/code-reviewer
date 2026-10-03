@@ -1,0 +1,42 @@
+import type { ModelComment } from './schema.js';
+
+const CATEGORY_LABEL: Record<ModelComment['category'], string> = {
+  bug: 'Bug',
+  security: 'Security',
+  performance: 'Performance',
+  'error-handling': 'Error handling',
+  concurrency: 'Concurrency',
+  'api-misuse': 'API misuse',
+  maintainability: 'Maintainability',
+  testing: 'Testing',
+};
+
+/** Markdown body of one inline review comment. */
+export function formatCommentBody(comment: ModelComment): string {
+  const parts = [
+    `**${CATEGORY_LABEL[comment.category]} (${comment.severity})**: ${comment.claim.trim()}`,
+  ];
+  const evidence = comment.evidence.trim();
+  if (evidence) {
+    parts.push(evidence.includes('\n') ? fence(evidence) : `> \`${evidence.replace(/`/g, "'")}\``);
+  }
+  if (comment.suggested_fix?.trim())
+    parts.push(`**Suggested fix:** ${comment.suggested_fix.trim()}`);
+  return parts.join('\n\n');
+}
+
+export function formatReviewBody(
+  posted: number,
+  meta: { strategy: string; model: string },
+): string {
+  const summary =
+    posted === 0
+      ? 'Reviewlens found no issues to flag in this change.'
+      : `Reviewlens left ${posted} comment${posted === 1 ? '' : 's'}.`;
+  return `${summary}\n\n<sub>strategy ${meta.strategy} · model ${meta.model}</sub>`;
+}
+
+function fence(code: string) {
+  const ticks = code.includes('```') ? '````' : '```';
+  return `${ticks}\n${code}\n${ticks}`;
+}
